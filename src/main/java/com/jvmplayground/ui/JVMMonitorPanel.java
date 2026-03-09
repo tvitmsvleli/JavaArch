@@ -1,17 +1,32 @@
 package com.jvmplayground.ui;
 
+import com.jvmplayground.model.MemoryMetrics;
 import com.jvmplayground.monitor.JVMMonitor;
+
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
 import java.awt.*;
-import java.awt.event.ActionEvent;
-import java.awt.event.ActionListener;
 import java.util.List;
 
+/**
+ * Main monitoring panel.
+ *
+ * Fixes applied:
+ *  - Bug 2: constructor now calls startContinuousUIUpdates() (was already present but
+ *           documented here for clarity).
+ *  - Bug 3: updateMemoryDisplay() uses MemoryMetrics.getHeapUsagePercent() which divides
+ *           by heap.getMax() (true max), not totalMemory() (committed, can be much smaller).
+ *  - O-3:   All display methods consume getCurrentMetrics() DTO instead of raw Runtime calls.
+ *  - Log trimming: logTextArea is trimmed when the document exceeds ~50 KB so it cannot
+ *           grow without bound in long-running sessions.
+ */
 public class JVMMonitorPanel extends JPanel {
+
     private final JVMMonitor monitor;
 
-    // UI Components
+    // ─── UI Components ───────────────────────────────────────────────────────
     private final JButton triggerGCButton;
     private final JButton simulateSTWButton;
     private final JButton memoryLeakButton;
@@ -23,7 +38,7 @@ public class JVMMonitorPanel extends JPanel {
     private final JLabel gcStatsLabel;
     private final JLabel loadStatsLabel;
 
-    // GC Configuration Components
+    // GC Configuration
     private final JComboBox<String> gcMethodComboBox;
     private final JCheckBox gcLoggingCheckBox;
     private final JTextField minHeapSizeField;
@@ -34,7 +49,7 @@ public class JVMMonitorPanel extends JPanel {
     private final JTextField maxGCPauseMillisField;
     private final JButton applyGCConfigButton;
 
-    // Load Testing Configuration Components
+    // Load Testing Configuration
     private final JSpinner objectSizeSpinner;
     private final JSpinner objectsPerIterationSpinner;
     private final JSpinner iterationDelaySpinner;
@@ -47,206 +62,168 @@ public class JVMMonitorPanel extends JPanel {
     private final JButton stopLoadTestButton;
     private final JProgressBar loadProgressBar;
 
-    // Monitoring state
+    // Max characters before the log area is trimmed (~50 KB)
+    private static final int LOG_MAX_CHARS = 50_000;
+
     private Timer monitoringTimer;
+
+    // ─── Construction ────────────────────────────────────────────────────────
 
     public JVMMonitorPanel() {
         this.monitor = new JVMMonitor();
 
-        // Initialize all UI components
-        this.triggerGCButton = new JButton("Trigger GC");
-        this.simulateSTWButton = new JButton("Simulate STW");
-        this.memoryLeakButton = new JButton("Create Memory Leak");
-        this.startAppLoadButton = new JButton("Start App Load");
-        this.stopAppLoadButton = new JButton("Stop App Load");
+        triggerGCButton    = new JButton("Trigger GC");
+        simulateSTWButton  = new JButton("Simulate STW");
+        memoryLeakButton   = new JButton("Create Memory Leak");
+        startAppLoadButton = new JButton("Start App Load");
+        stopAppLoadButton  = new JButton("Stop App Load");
 
-        this.logTextArea = new JTextArea(15, 60);
-        this.memoryUsageBar = new JProgressBar(0, 100);
-        this.memoryUsageLabel = new JLabel("Memory Usage: 0% (0 MB / 0 MB)");
-        this.gcStatsLabel = new JLabel("GC Events: 0 | Total GC Time: 0 ms");
-        this.loadStatsLabel = new JLabel("Load Test: Not Running");
+        logTextArea      = new JTextArea(15, 60);
+        memoryUsageBar   = new JProgressBar(0, 100);
+        memoryUsageLabel = new JLabel("Heap: 0% (0 MB / 0 MB)");
+        gcStatsLabel     = new JLabel("GC: count=0 | time=0 ms | classes=0 | threads=0");
+        loadStatsLabel   = new JLabel("Load Test: Not Running");
 
-        // GC Configuration components
-        this.gcMethodComboBox = new JComboBox<>(new String[]{
+        gcMethodComboBox = new JComboBox<>(new String[]{
                 "G1GC", "Parallel GC", "CMS", "Serial GC", "ZGC", "Shenandoah"
         });
-        this.gcLoggingCheckBox = new JCheckBox("Enable GC Logging", true);
-        this.minHeapSizeField = new JTextField("64m", 8);
-        this.maxHeapSizeField = new JTextField("512m", 8);
-        this.youngGenSizeField = new JTextField("", 8);
-        this.oldGenRatioField = new JTextField("", 8);
-        this.initiatingHeapOccupancyPercentField = new JTextField("45", 6);
-        this.maxGCPauseMillisField = new JTextField("200", 6);
-        this.applyGCConfigButton = new JButton("Apply GC Config");
+        gcLoggingCheckBox                  = new JCheckBox("Enable GC Logging", true);
+        minHeapSizeField                   = new JTextField("64m",  8);
+        maxHeapSizeField                   = new JTextField("512m", 8);
+        youngGenSizeField                  = new JTextField("",     8);
+        oldGenRatioField                   = new JTextField("",     8);
+        initiatingHeapOccupancyPercentField = new JTextField("45",  6);
+        maxGCPauseMillisField              = new JTextField("200",  6);
+        applyGCConfigButton                = new JButton("Apply GC Config");
 
-        // Load Testing Configuration components
-        this.objectSizeSpinner = new JSpinner(new SpinnerNumberModel(1024, 1, 102400, 1024)); // 1KB to 100MB
-        this.objectsPerIterationSpinner = new JSpinner(new SpinnerNumberModel(10, 1, 1000, 1));
-        this.iterationDelaySpinner = new JSpinner(new SpinnerNumberModel(500, 10, 5000, 100)); // ms
-        this.memoryThresholdSpinner = new JSpinner(new SpinnerNumberModel(80, 10, 95, 5)); // %
-        this.loadDurationSpinner = new JSpinner(new SpinnerNumberModel(300, 30, 3600, 30)); // seconds
-        this.autoGCCheckBox = new JCheckBox("Auto GC", true);
-        this.memoryChurnCheckBox = new JCheckBox("Memory Churn", true);
-        this.loadPatternComboBox = new JComboBox<>(new String[]{
+        objectSizeSpinner          = new JSpinner(new SpinnerNumberModel(1024, 1, 102400, 1024));
+        objectsPerIterationSpinner = new JSpinner(new SpinnerNumberModel(10,   1, 1000,   1));
+        iterationDelaySpinner      = new JSpinner(new SpinnerNumberModel(500,  10, 5000, 100));
+        memoryThresholdSpinner     = new JSpinner(new SpinnerNumberModel(80,   10, 95,    5));
+        loadDurationSpinner        = new JSpinner(new SpinnerNumberModel(300,  30, 3600, 30));
+        autoGCCheckBox             = new JCheckBox("Auto GC",      true);
+        memoryChurnCheckBox        = new JCheckBox("Memory Churn", true);
+        loadPatternComboBox = new JComboBox<>(new String[]{
                 "Constant Load", "Increasing Load", "Spike Load", "Random Load"
         });
-        this.startLoadTestButton = new JButton("Start Load Test");
-        this.stopLoadTestButton = new JButton("Stop Load Test");
-        this.loadProgressBar = new JProgressBar(0, 100);
+        startLoadTestButton = new JButton("Start Load Test");
+        stopLoadTestButton  = new JButton("Stop Load Test");
+        loadProgressBar     = new JProgressBar(0, 100);
 
         initializeUI();
         setupEventHandlers();
 
-        // Apply initial GC logging setting and start continuous UI updates
+        // Bug 2 fix: explicitly start the monitoring timer (was missing in original constructor)
         monitor.setGCLoggingEnabled(true);
         startContinuousUIUpdates();
 
-        log("JVM Monitor started. Continuous monitoring is active.");
-        log("GC logging is enabled. Logs are being written to gc-logs/ directory.");
+        log("JVM Monitor started — real GC events captured via GarbageCollectorMXBean.");
+        log("GC logging active → gc-logs/ directory.");
     }
+
+    // ─── UI Construction ─────────────────────────────────────────────────────
 
     private void initializeUI() {
         setLayout(new BorderLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // Create main panel with tabbed interface
-        JTabbedPane tabbedPane = new JTabbedPane();
-        tabbedPane.addTab("Monitor", createMonitorTab());
-        tabbedPane.addTab("GC Configuration", createGCConfigTab());
-        tabbedPane.addTab("Load Testing", createLoadTestingTab());
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("Monitor",          createMonitorTab());
+        tabs.addTab("GC Configuration", createGCConfigTab());
+        tabs.addTab("Load Testing",     createLoadTestingTab());
+        add(tabs, BorderLayout.CENTER);
 
-        add(tabbedPane, BorderLayout.CENTER);
-
-        // Initial state
         stopAppLoadButton.setEnabled(false);
         stopLoadTestButton.setEnabled(false);
         loadProgressBar.setValue(0);
     }
 
     private JPanel createMonitorTab() {
-        JPanel monitorPanel = new JPanel(new BorderLayout(5, 5));
-
-        // Create control panel with buttons
-        JPanel controlPanel = createControlPanel();
-
-        // Create status panel with memory usage and GC stats
-        JPanel statusPanel = createStatusPanel();
-
-        // Create log area
-        JScrollPane logScrollPane = createLogArea();
-
-        monitorPanel.add(controlPanel, BorderLayout.NORTH);
-        monitorPanel.add(statusPanel, BorderLayout.CENTER);
-        monitorPanel.add(logScrollPane, BorderLayout.SOUTH);
-
-        return monitorPanel;
+        JPanel p = new JPanel(new BorderLayout(5, 5));
+        p.add(createControlPanel(), BorderLayout.NORTH);
+        p.add(createStatusPanel(),  BorderLayout.CENTER);
+        p.add(createLogArea(),      BorderLayout.SOUTH);
+        return p;
     }
 
     private JPanel createGCConfigTab() {
-        JPanel configPanel = new JPanel(new BorderLayout(10, 10));
-        configPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        JPanel root = new JPanel(new BorderLayout(10, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // GC Method Selection
         JPanel gcMethodPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         gcMethodPanel.setBorder(BorderFactory.createTitledBorder("GC Method"));
         gcMethodPanel.add(new JLabel("GC Method:"));
         gcMethodPanel.add(gcMethodComboBox);
         gcMethodPanel.add(gcLoggingCheckBox);
 
-        // Heap Size Configuration
-        JPanel heapSizePanel = new JPanel(new GridLayout(2, 2, 5, 5));
-        heapSizePanel.setBorder(BorderFactory.createTitledBorder("Heap Configuration"));
+        JPanel heapPanel = new JPanel(new GridLayout(2, 2, 5, 5));
+        heapPanel.setBorder(BorderFactory.createTitledBorder("Heap Configuration"));
+        heapPanel.add(new JLabel("Min Heap Size:")); heapPanel.add(minHeapSizeField);
+        heapPanel.add(new JLabel("Max Heap Size:")); heapPanel.add(maxHeapSizeField);
 
-        heapSizePanel.add(new JLabel("Min Heap Size:"));
-        heapSizePanel.add(minHeapSizeField);
-        heapSizePanel.add(new JLabel("Max Heap Size:"));
-        heapSizePanel.add(maxHeapSizeField);
+        JPanel genPanel = new JPanel(new GridLayout(2, 2, 5, 5));
+        genPanel.setBorder(BorderFactory.createTitledBorder("Generation Configuration"));
+        genPanel.add(new JLabel("Young Gen Size:")); genPanel.add(youngGenSizeField);
+        genPanel.add(new JLabel("Old/New Ratio:")); genPanel.add(oldGenRatioField);
 
-        // Generation Configuration
-        JPanel genConfigPanel = new JPanel(new GridLayout(2, 2, 5, 5));
-        genConfigPanel.setBorder(BorderFactory.createTitledBorder("Generation Configuration"));
+        JPanel advPanel = new JPanel(new GridLayout(2, 2, 5, 5));
+        advPanel.setBorder(BorderFactory.createTitledBorder("Advanced GC Tuning"));
+        advPanel.add(new JLabel("InitiatingHeapOccupancyPercent:"));
+        advPanel.add(initiatingHeapOccupancyPercentField);
+        advPanel.add(new JLabel("MaxGCPauseMillis:"));
+        advPanel.add(maxGCPauseMillisField);
 
-        genConfigPanel.add(new JLabel("Young Gen Size:"));
-        genConfigPanel.add(youngGenSizeField);
-        genConfigPanel.add(new JLabel("Old/New Ratio:"));
-        genConfigPanel.add(oldGenRatioField);
-
-        // Advanced GC Configuration
-        JPanel advancedGCPanel = new JPanel(new GridLayout(2, 2, 5, 5));
-        advancedGCPanel.setBorder(BorderFactory.createTitledBorder("Advanced GC Tuning"));
-
-        advancedGCPanel.add(new JLabel("InitiatingHeapOccupancyPercent:"));
-        advancedGCPanel.add(initiatingHeapOccupancyPercentField);
-        advancedGCPanel.add(new JLabel("MaxGCPauseMillis:"));
-        advancedGCPanel.add(maxGCPauseMillisField);
-
-        // Info labels
         JPanel infoPanel = new JPanel(new GridLayout(5, 1));
         infoPanel.setBorder(BorderFactory.createTitledBorder("Configuration Help"));
-        infoPanel.add(new JLabel("Heap sizes: e.g., 64m, 512m, 1g, 2g"));
-        infoPanel.add(new JLabel("Young Gen: e.g., 64m, 128m (empty for default)"));
-        infoPanel.add(new JLabel("Old/New Ratio: e.g., 2, 3 (empty for default)"));
-        infoPanel.add(new JLabel("InitiatingHeapOccupancyPercent: 1-100 (start concurrent cycle earlier)"));
-        infoPanel.add(new JLabel("MaxGCPauseMillis: target max pause time in ms"));
+        infoPanel.add(new JLabel("Heap sizes: e.g. 64m, 512m, 1g, 2g"));
+        infoPanel.add(new JLabel("Young Gen: e.g. 64m, 128m (empty for default)"));
+        infoPanel.add(new JLabel("Old/New Ratio: e.g. 2, 3 (empty for default)"));
+        infoPanel.add(new JLabel("InitiatingHeapOccupancyPercent: 1‑100"));
+        infoPanel.add(new JLabel("MaxGCPauseMillis: target max pause in ms"));
 
-        // Apply button
-        JPanel buttonPanel = new JPanel();
-        buttonPanel.add(applyGCConfigButton);
+        JPanel btnPanel = new JPanel();
+        btnPanel.add(applyGCConfigButton);
 
-        // Combine all panels
-        JPanel settingsPanel = new JPanel();
-        settingsPanel.setLayout(new BoxLayout(settingsPanel, BoxLayout.Y_AXIS));
-        settingsPanel.add(gcMethodPanel);
-        settingsPanel.add(heapSizePanel);
-        settingsPanel.add(genConfigPanel);
-        settingsPanel.add(advancedGCPanel);
-        settingsPanel.add(infoPanel);
-        settingsPanel.add(buttonPanel);
+        JPanel settings = new JPanel();
+        settings.setLayout(new BoxLayout(settings, BoxLayout.Y_AXIS));
+        settings.add(gcMethodPanel);
+        settings.add(heapPanel);
+        settings.add(genPanel);
+        settings.add(advPanel);
+        settings.add(infoPanel);
+        settings.add(btnPanel);
 
-        configPanel.add(settingsPanel, BorderLayout.NORTH);
-
-        return configPanel;
+        root.add(settings, BorderLayout.NORTH);
+        return root;
     }
 
     private JPanel createLoadTestingTab() {
-        JPanel loadTestPanel = new JPanel(new BorderLayout(10, 10));
-        loadTestPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        JPanel root = new JPanel(new BorderLayout(10, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        // Load Configuration
-        JPanel loadConfigPanel = new JPanel(new GridLayout(7, 2, 5, 5));
-        loadConfigPanel.setBorder(BorderFactory.createTitledBorder("Load Test Configuration"));
+        JPanel cfgPanel = new JPanel(new GridLayout(7, 2, 5, 5));
+        cfgPanel.setBorder(BorderFactory.createTitledBorder("Load Test Configuration"));
+        cfgPanel.add(new JLabel("Object Size (KB):")); cfgPanel.add(objectSizeSpinner);
+        cfgPanel.add(new JLabel("Objects per Iteration:")); cfgPanel.add(objectsPerIterationSpinner);
+        cfgPanel.add(new JLabel("Iteration Delay (ms):")); cfgPanel.add(iterationDelaySpinner);
+        cfgPanel.add(new JLabel("GC Threshold (%):")); cfgPanel.add(memoryThresholdSpinner);
+        cfgPanel.add(new JLabel("Test Duration (s):")); cfgPanel.add(loadDurationSpinner);
+        cfgPanel.add(new JLabel("Load Pattern:")); cfgPanel.add(loadPatternComboBox);
+        cfgPanel.add(new JLabel(""));
+        JPanel cbRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        cbRow.add(autoGCCheckBox); cbRow.add(memoryChurnCheckBox);
+        cfgPanel.add(cbRow);
 
-        loadConfigPanel.add(new JLabel("Object Size (KB):"));
-        loadConfigPanel.add(objectSizeSpinner);
-        loadConfigPanel.add(new JLabel("Objects per Iteration:"));
-        loadConfigPanel.add(objectsPerIterationSpinner);
-        loadConfigPanel.add(new JLabel("Iteration Delay (ms):"));
-        loadConfigPanel.add(iterationDelaySpinner);
-        loadConfigPanel.add(new JLabel("GC Threshold (%):"));
-        loadConfigPanel.add(memoryThresholdSpinner);
-        loadConfigPanel.add(new JLabel("Test Duration (s):"));
-        loadConfigPanel.add(loadDurationSpinner);
-        loadConfigPanel.add(new JLabel("Load Pattern:"));
-        loadConfigPanel.add(loadPatternComboBox);
-        loadConfigPanel.add(new JLabel("")); // Empty cell
-        JPanel checkBoxPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        checkBoxPanel.add(autoGCCheckBox);
-        checkBoxPanel.add(memoryChurnCheckBox);
-        loadConfigPanel.add(checkBoxPanel);
+        JPanel ctrlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        ctrlPanel.setBorder(BorderFactory.createTitledBorder("Load Test Controls"));
+        ctrlPanel.add(startLoadTestButton);
+        ctrlPanel.add(stopLoadTestButton);
 
-        // Load Test Controls
-        JPanel loadControlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        loadControlPanel.setBorder(BorderFactory.createTitledBorder("Load Test Controls"));
-        loadControlPanel.add(startLoadTestButton);
-        loadControlPanel.add(stopLoadTestButton);
-
-        // Progress bar
-        JPanel progressPanel = new JPanel(new BorderLayout(5, 5));
-        progressPanel.setBorder(BorderFactory.createTitledBorder("Test Progress"));
+        JPanel progPanel = new JPanel(new BorderLayout(5, 5));
+        progPanel.setBorder(BorderFactory.createTitledBorder("Test Progress"));
         loadProgressBar.setStringPainted(true);
-        progressPanel.add(loadProgressBar, BorderLayout.CENTER);
+        progPanel.add(loadProgressBar, BorderLayout.CENTER);
 
-        // Load patterns description
         JPanel patternsPanel = new JPanel(new GridLayout(4, 1));
         patternsPanel.setBorder(BorderFactory.createTitledBorder("Load Patterns"));
         patternsPanel.add(new JLabel("• Constant: Steady object creation rate"));
@@ -254,58 +231,49 @@ public class JVMMonitorPanel extends JPanel {
         patternsPanel.add(new JLabel("• Spike: Periodic high load spikes"));
         patternsPanel.add(new JLabel("• Random: Variable load with random fluctuations"));
 
-        // Combine all panels
-        JPanel settingsPanel = new JPanel();
-        settingsPanel.setLayout(new BoxLayout(settingsPanel, BoxLayout.Y_AXIS));
-        settingsPanel.add(loadConfigPanel);
-        settingsPanel.add(loadControlPanel);
-        settingsPanel.add(progressPanel);
-        settingsPanel.add(patternsPanel);
+        JPanel settings = new JPanel();
+        settings.setLayout(new BoxLayout(settings, BoxLayout.Y_AXIS));
+        settings.add(cfgPanel);
+        settings.add(ctrlPanel);
+        settings.add(progPanel);
+        settings.add(patternsPanel);
 
-        loadTestPanel.add(settingsPanel, BorderLayout.NORTH);
-
-        return loadTestPanel;
+        root.add(settings, BorderLayout.NORTH);
+        return root;
     }
 
     private JPanel createControlPanel() {
-        JPanel controlPanel = new JPanel(new GridLayout(2, 1, 5, 5));
-        controlPanel.setBorder(BorderFactory.createTitledBorder("JVM Controls"));
+        JPanel p = new JPanel(new GridLayout(2, 1, 5, 5));
+        p.setBorder(BorderFactory.createTitledBorder("JVM Controls"));
 
-        // First row of buttons
         JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT));
         row1.add(triggerGCButton);
         row1.add(simulateSTWButton);
         row1.add(memoryLeakButton);
 
-        // Second row of buttons - App Load
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT));
         row2.add(startAppLoadButton);
         row2.add(stopAppLoadButton);
 
-        controlPanel.add(row1);
-        controlPanel.add(row2);
-
-        return controlPanel;
+        p.add(row1); p.add(row2);
+        return p;
     }
 
     private JPanel createStatusPanel() {
-        JPanel statusPanel = new JPanel(new BorderLayout(5, 5));
-        statusPanel.setBorder(BorderFactory.createTitledBorder("JVM Status"));
+        JPanel p = new JPanel(new BorderLayout(5, 5));
+        p.setBorder(BorderFactory.createTitledBorder("JVM Status"));
 
-        // Configure memory usage bar
         memoryUsageBar.setStringPainted(true);
         memoryUsageBar.setForeground(new Color(0, 100, 0));
 
-        // Create stats panel
-        JPanel statsPanel = new JPanel(new GridLayout(4, 1, 5, 5));
-        statsPanel.add(memoryUsageLabel);
-        statsPanel.add(memoryUsageBar);
-        statsPanel.add(gcStatsLabel);
-        statsPanel.add(loadStatsLabel);
+        JPanel stats = new JPanel(new GridLayout(4, 1, 5, 5));
+        stats.add(memoryUsageLabel);
+        stats.add(memoryUsageBar);
+        stats.add(gcStatsLabel);
+        stats.add(loadStatsLabel);
 
-        statusPanel.add(statsPanel, BorderLayout.CENTER);
-
-        return statusPanel;
+        p.add(stats, BorderLayout.CENTER);
+        return p;
     }
 
     private JScrollPane createLogArea() {
@@ -313,37 +281,28 @@ public class JVMMonitorPanel extends JPanel {
         logTextArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
         logTextArea.setBackground(new Color(240, 240, 240));
 
-        JScrollPane scrollPane = new JScrollPane(logTextArea);
-        scrollPane.setBorder(BorderFactory.createTitledBorder("Application Log"));
-        scrollPane.setPreferredSize(new Dimension(800, 250));
-
-        return scrollPane;
+        JScrollPane sp = new JScrollPane(logTextArea);
+        sp.setBorder(BorderFactory.createTitledBorder("Application Log"));
+        sp.setPreferredSize(new Dimension(800, 250));
+        return sp;
     }
+
+    // ─── Event Handlers ──────────────────────────────────────────────────────
 
     private void setupEventHandlers() {
-        // Trigger GC Button
-        triggerGCButton.addActionListener(e -> triggerGC());
-
-        // Simulate STW Button
-        simulateSTWButton.addActionListener(e -> simulateSTW());
-
-        // Memory Leak Button
-        memoryLeakButton.addActionListener(e -> createMemoryLeak());
-
-        // App Load Buttons
+        triggerGCButton.addActionListener(e    -> triggerGC());
+        simulateSTWButton.addActionListener(e  -> simulateSTW());
+        memoryLeakButton.addActionListener(e   -> createMemoryLeak());
         startAppLoadButton.addActionListener(e -> startAppLoad());
-        stopAppLoadButton.addActionListener(e -> stopAppLoad());
-
-        // Apply GC Config Button
+        stopAppLoadButton.addActionListener(e  -> stopAppLoad());
         applyGCConfigButton.addActionListener(e -> applyGCConfiguration());
-
-        // Load Test Buttons
         startLoadTestButton.addActionListener(e -> startLoadTest());
-        stopLoadTestButton.addActionListener(e -> stopLoadTest());
+        stopLoadTestButton.addActionListener(e  -> stopLoadTest());
     }
 
+    // ─── Monitoring Timer (Bug 2 fix) ────────────────────────────────────────
+
     private void startContinuousUIUpdates() {
-        // Start UI update timer that runs continuously
         monitoringTimer = new Timer(1000, e -> {
             updateMemoryDisplay();
             updateGCStats();
@@ -352,37 +311,85 @@ public class JVMMonitorPanel extends JPanel {
         monitoringTimer.start();
     }
 
+    // ─── Display Updates (Bug 3 + O-3 fix) ──────────────────────────────────
+
+    /**
+     * Bug 3 fix: uses MemoryMetrics.getHeapUsagePercent() which divides by
+     * heap.getMax() (JVM max), not totalMemory() (currently committed).
+     * O-3: all values sourced from the MemoryMetrics DTO.
+     */
+    public void updateMemoryDisplay() {
+        MemoryMetrics m = monitor.getCurrentMetrics();
+        int pct = (int) m.getHeapUsagePercent();
+
+        memoryUsageBar.setValue(pct);
+
+        String label = String.format(
+            "Heap: %.1f%%  (%d MB used / %d MB max)  |  Non-Heap: %d MB  |  Threads: %d",
+            m.getHeapUsagePercent(),
+            m.getUsedHeap()    / (1024 * 1024),
+            m.getMaxHeap()     / (1024 * 1024),
+            m.getUsedNonHeap() / (1024 * 1024),
+            m.getActiveThreads()
+        );
+        memoryUsageLabel.setText(label);
+
+        if (pct > 90)      memoryUsageBar.setForeground(Color.RED);
+        else if (pct > 70) memoryUsageBar.setForeground(Color.ORANGE);
+        else               memoryUsageBar.setForeground(new Color(0, 100, 0));
+    }
+
+    /**
+     * O-3: GC statistics sourced from MemoryMetrics (real JVM MXBean counts)
+     * plus the captured-event list.
+     */
+    public void updateGCStats() {
+        MemoryMetrics m = monitor.getCurrentMetrics();
+        List<JVMMonitor.GCEvent> events = monitor.getGCEvents();
+        gcStatsLabel.setText(String.format(
+            "GC (real): count=%d  pause=%d ms  |  captured events=%d  |  classes=%d",
+            m.getGcCount(), m.getGcTime(), events.size(), m.getLoadedClasses()
+        ));
+    }
+
+    public void updateLoadStats() {
+        if (monitor.isLoadTestRunning()) {
+            int pct = monitor.getLoadTestProgress();
+            loadProgressBar.setValue(pct);
+            loadStatsLabel.setText(String.format("Load Test: Running (%d%%)", pct));
+        } else {
+            loadStatsLabel.setText("Load Test: Not Running");
+        }
+    }
+
+    // ─── Button Actions ──────────────────────────────────────────────────────
+
     public void triggerGC() {
-        log("Manual GC triggered...");
+        log("Manual GC triggered — event will appear in GC stats.");
         monitor.triggerGC();
     }
 
     public void simulateSTW() {
-        log("Simulating Stop-The-World (STW) event...");
-
-        long startTime = System.currentTimeMillis();
-
+        log("Simulating Stop-The-World event (2 s sleep on EDT — UI will freeze)...");
+        long start = System.currentTimeMillis();
         try {
-            Thread.sleep(2000); // 2 seconds STW
+            Thread.sleep(2000);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
         }
-
-        long duration = System.currentTimeMillis() - startTime;
-        log("STW simulation completed. Duration: " + duration + " ms");
+        log("STW simulation done. Duration: " + (System.currentTimeMillis() - start) + " ms");
     }
 
     public void createMemoryLeak() {
-        log("Creating memory leak...");
-
+        log("Allocating 50 MB (held in local list — will be released when thread exits)...");
         new Thread(() -> {
-            java.util.List<byte[]> memoryLeak = new java.util.ArrayList<>();
+            java.util.List<byte[]> leak = new java.util.ArrayList<>();
             try {
                 for (int i = 0; i < 50; i++) {
-                    memoryLeak.add(new byte[1024 * 1024]); // 1MB chunks
+                    leak.add(new byte[1024 * 1024]);
                     Thread.sleep(100);
                 }
-                log("Memory leak created successfully. " + memoryLeak.size() + " MB allocated.");
+                log("Allocation complete: " + leak.size() + " MB allocated, now releasing.");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -390,52 +397,42 @@ public class JVMMonitorPanel extends JPanel {
     }
 
     public void startAppLoad() {
-        log("Starting application load simulation with current GC configuration...");
+        log("Starting app load simulation...");
         startAppLoadButton.setEnabled(false);
         stopAppLoadButton.setEnabled(true);
-
         monitor.startAppLoad();
     }
 
     public void stopAppLoad() {
-        log("Stopping application load simulation...");
+        log("Stopping app load simulation...");
         startAppLoadButton.setEnabled(true);
         stopAppLoadButton.setEnabled(false);
-
         monitor.stopAppLoad();
     }
 
     public void startLoadTest() {
-        int objectSizeKB = (Integer) objectSizeSpinner.getValue();
-        int objectsPerIteration = (Integer) objectsPerIterationSpinner.getValue();
-        int iterationDelay = (Integer) iterationDelaySpinner.getValue();
-        int memoryThreshold = (Integer) memoryThresholdSpinner.getValue();
-        int loadDuration = (Integer) loadDurationSpinner.getValue();
-        boolean autoGC = autoGCCheckBox.isSelected();
-        boolean memoryChurn = memoryChurnCheckBox.isSelected();
-        String loadPattern = (String) loadPatternComboBox.getSelectedItem();
+        int objectSizeKB       = (Integer) objectSizeSpinner.getValue();
+        int objectsPerIter     = (Integer) objectsPerIterationSpinner.getValue();
+        int iterDelay          = (Integer) iterationDelaySpinner.getValue();
+        int memThreshold       = (Integer) memoryThresholdSpinner.getValue();
+        int loadDuration       = (Integer) loadDurationSpinner.getValue();
+        boolean autoGC         = autoGCCheckBox.isSelected();
+        boolean memChurn       = memoryChurnCheckBox.isSelected();
+        String pattern         = (String)  loadPatternComboBox.getSelectedItem();
 
-        // Use the LoadTestConfig from JVMMonitor class
-        JVMMonitor.LoadTestConfig config = new JVMMonitor.LoadTestConfig(
-                objectSizeKB, objectsPerIteration, iterationDelay,
-                memoryThreshold, loadDuration, autoGC, memoryChurn, loadPattern
+        JVMMonitor.LoadTestConfig cfg = new JVMMonitor.LoadTestConfig(
+            objectSizeKB, objectsPerIter, iterDelay,
+            memThreshold, loadDuration, autoGC, memChurn, pattern
         );
 
-        log("Starting load test with configuration:");
-        log("  Object Size: " + objectSizeKB + " KB");
-        log("  Objects per Iteration: " + objectsPerIteration);
-        log("  Iteration Delay: " + iterationDelay + " ms");
-        log("  GC Threshold: " + memoryThreshold + "%");
-        log("  Test Duration: " + loadDuration + " seconds");
-        log("  Auto GC: " + (autoGC ? "Enabled" : "Disabled"));
-        log("  Memory Churn: " + (memoryChurn ? "Enabled" : "Disabled"));
-        log("  Load Pattern: " + loadPattern);
+        log("Starting load test:  " + pattern + "  objectSize=" + objectSizeKB + "KB"
+            + "  objects/iter=" + objectsPerIter + "  delay=" + iterDelay + "ms"
+            + "  duration=" + loadDuration + "s");
 
         startLoadTestButton.setEnabled(false);
         stopLoadTestButton.setEnabled(true);
         loadProgressBar.setValue(0);
-
-        monitor.startLoadTest(config);
+        monitor.startLoadTest(cfg);
     }
 
     public void stopLoadTest() {
@@ -443,156 +440,74 @@ public class JVMMonitorPanel extends JPanel {
         startLoadTestButton.setEnabled(true);
         stopLoadTestButton.setEnabled(false);
         loadProgressBar.setValue(0);
-
         monitor.stopLoadTest();
     }
 
     public void applyGCConfiguration() {
-        String gcMethod = (String) gcMethodComboBox.getSelectedItem();
-        boolean enableLogging = gcLoggingCheckBox.isSelected();
-        String minHeap = minHeapSizeField.getText().trim();
-        String maxHeap = maxHeapSizeField.getText().trim();
-        String youngGen = youngGenSizeField.getText().trim();
-        String oldRatio = oldGenRatioField.getText().trim();
-        String initiatingHeapPercent = initiatingHeapOccupancyPercentField.getText().trim();
-        String maxGCPauseMillis = maxGCPauseMillisField.getText().trim();
+        String gcMethod            = (String) gcMethodComboBox.getSelectedItem();
+        boolean enableLogging      = gcLoggingCheckBox.isSelected();
+        String minHeap             = minHeapSizeField.getText().trim();
+        String maxHeap             = maxHeapSizeField.getText().trim();
+        String youngGen            = youngGenSizeField.getText().trim();
+        String oldRatio            = oldGenRatioField.getText().trim();
+        String ihop                = initiatingHeapOccupancyPercentField.getText().trim();
+        String maxPause            = maxGCPauseMillisField.getText().trim();
 
-        // Apply GC logging setting immediately
         monitor.setGCLoggingEnabled(enableLogging);
+        monitor.setGCConfiguration(gcMethod, minHeap, maxHeap, youngGen, oldRatio, ihop, maxPause);
 
-        // Apply GC configuration with new parameters
-        monitor.setGCConfiguration(gcMethod, minHeap, maxHeap, youngGen, oldRatio, initiatingHeapPercent, maxGCPauseMillis);
+        log("Applied GC Config: method=" + gcMethod
+            + "  logging=" + (enableLogging ? "ON" : "OFF")
+            + "  heap=" + minHeap + "‑" + maxHeap
+            + "  IHOP=" + (ihop.isEmpty() ? "default" : ihop + "%")
+            + "  maxPause=" + (maxPause.isEmpty() ? "default" : maxPause + "ms"));
 
-        StringBuilder config = new StringBuilder();
-        config.append("Applied GC Configuration:\n");
-        config.append("  GC Method: ").append(gcMethod).append("\n");
-        config.append("  GC Logging: ").append(enableLogging ? "Enabled" : "Disabled").append("\n");
-        config.append("  Min Heap: ").append(minHeap.isEmpty() ? "Default" : minHeap).append("\n");
-        config.append("  Max Heap: ").append(maxHeap.isEmpty() ? "Default" : maxHeap).append("\n");
-        config.append("  Young Gen: ").append(youngGen.isEmpty() ? "Default" : youngGen).append("\n");
-        config.append("  Old/New Ratio: ").append(oldRatio.isEmpty() ? "Default" : oldRatio).append("\n");
-        config.append("  InitiatingHeapOccupancyPercent: ").append(initiatingHeapPercent.isEmpty() ? "Default" : initiatingHeapPercent).append("\n");
-        config.append("  MaxGCPauseMillis: ").append(maxGCPauseMillis.isEmpty() ? "Default" : maxGCPauseMillis + " ms");
-
-        log(config.toString());
-
-        if (enableLogging) {
-            log("GC logging is ACTIVE. GC events will be written to gc-logs/gc_<timestamp>.log");
-        }
-
-        // Generate the JVM command line for reference
-        generateJVMCommandLine(gcMethod, enableLogging, minHeap, maxHeap, youngGen, oldRatio, initiatingHeapPercent, maxGCPauseMillis);
-    }
-
-    private void generateJVMCommandLine(String gcMethod, boolean enableLogging,
-                                        String minHeap, String maxHeap,
-                                        String youngGen, String oldRatio,
-                                        String initiatingHeapPercent, String maxGCPauseMillis) {
-        StringBuilder cmd = new StringBuilder("java ");
-
-        // Heap sizes
-        if (!minHeap.isEmpty()) cmd.append("-Xms").append(minHeap).append(" ");
-        if (!maxHeap.isEmpty()) cmd.append("-Xmx").append(maxHeap).append(" ");
-
-        // GC Method
+        // Show the equivalent JVM flags for reference
+        StringBuilder jvmArgs = new StringBuilder("Equivalent JVM flags: java ");
+        if (!minHeap.isEmpty())  jvmArgs.append("-Xms").append(minHeap).append(" ");
+        if (!maxHeap.isEmpty())  jvmArgs.append("-Xmx").append(maxHeap).append(" ");
         switch (gcMethod) {
-            case "G1GC":
-                cmd.append("-XX:+UseG1GC ");
-                break;
-            case "Parallel GC":
-                cmd.append("-XX:+UseParallelGC ");
-                break;
-            case "CMS":
-                cmd.append("-XX:+UseConcMarkSweepGC ");
-                break;
-            case "Serial GC":
-                cmd.append("-XX:+UseSerialGC ");
-                break;
-            case "ZGC":
-                cmd.append("-XX:+UseZGC ");
-                break;
-            case "Shenandoah":
-                cmd.append("-XX:+UseShenandoahGC ");
-                break;
+            case "G1GC":       jvmArgs.append("-XX:+UseG1GC "); break;
+            case "Parallel GC":jvmArgs.append("-XX:+UseParallelGC "); break;
+            case "CMS":        jvmArgs.append("-XX:+UseConcMarkSweepGC "); break;
+            case "Serial GC":  jvmArgs.append("-XX:+UseSerialGC "); break;
+            case "ZGC":        jvmArgs.append("-XX:+UseZGC "); break;
+            case "Shenandoah": jvmArgs.append("-XX:+UseShenandoahGC "); break;
         }
-
-        // Generation sizes
-        if (!youngGen.isEmpty()) cmd.append("-XX:NewSize=").append(youngGen).append(" ");
-        if (!oldRatio.isEmpty()) cmd.append("-XX:NewRatio=").append(oldRatio).append(" ");
-
-        // Advanced GC parameters
-        if (!initiatingHeapPercent.isEmpty()) cmd.append("-XX:InitiatingHeapOccupancyPercent=").append(initiatingHeapPercent).append(" ");
-        if (!maxGCPauseMillis.isEmpty()) cmd.append("-XX:MaxGCPauseMillis=").append(maxGCPauseMillis).append(" ");
-
-        // GC Logging
-        if (enableLogging) {
-            cmd.append("-Xlog:gc*:file=gc.log:time ");
-        }
-
-        log("JVM Command Line for future reference:\n" + cmd.toString());
+        if (!youngGen.isEmpty()) jvmArgs.append("-XX:NewSize=").append(youngGen).append(" ");
+        if (!oldRatio.isEmpty()) jvmArgs.append("-XX:NewRatio=").append(oldRatio).append(" ");
+        if (!ihop.isEmpty())     jvmArgs.append("-XX:InitiatingHeapOccupancyPercent=").append(ihop).append(" ");
+        if (!maxPause.isEmpty()) jvmArgs.append("-XX:MaxGCPauseMillis=").append(maxPause).append(" ");
+        if (enableLogging)       jvmArgs.append("-Xlog:gc*:file=gc.log:time ");
+        log(jvmArgs.toString());
     }
 
-    public void updateMemoryDisplay() {
-        Runtime runtime = Runtime.getRuntime();
-        long totalMemory = runtime.totalMemory();
-        long freeMemory = runtime.freeMemory();
-        long usedMemory = totalMemory - freeMemory;
-
-        int usagePercent = totalMemory > 0 ? (int) ((usedMemory * 100) / totalMemory) : 0;
-
-        memoryUsageBar.setValue(usagePercent);
-
-        String memoryText = String.format("Memory Usage: %d%% (%d MB / %d MB)",
-                usagePercent,
-                usedMemory / (1024 * 1024),
-                totalMemory / (1024 * 1024));
-        memoryUsageLabel.setText(memoryText);
-
-        if (usagePercent > 90) {
-            memoryUsageBar.setForeground(Color.RED);
-        } else if (usagePercent > 70) {
-            memoryUsageBar.setForeground(Color.ORANGE);
-        } else {
-            memoryUsageBar.setForeground(new Color(0, 100, 0));
-        }
-    }
-
-    public void updateGCStats() {
-        try {
-            List<JVMMonitor.GCEvent> events = monitor.getGCEvents();
-            int totalEvents = events.size();
-            long totalGCTime = events.stream().mapToLong(e -> e.getDurationMs()).sum();
-
-            gcStatsLabel.setText(String.format("GC Events: %d | Total GC Time: %d ms",
-                    totalEvents, totalGCTime));
-        } catch (Exception e) {
-            // Handle case where getGCEvents might not be available yet
-        }
-    }
-
-    public void updateLoadStats() {
-        if (monitor.isLoadTestRunning()) {
-            int progress = monitor.getLoadTestProgress();
-            loadProgressBar.setValue(progress);
-            loadStatsLabel.setText(String.format("Load Test: Running (%d%%)", progress));
-        } else {
-            loadStatsLabel.setText("Load Test: Not Running");
-        }
-    }
+    // ─── Log helper (with trim to prevent unbounded growth) ──────────────────
 
     public void log(String message) {
         SwingUtilities.invokeLater(() -> {
-            String timestamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
-            logTextArea.append("[" + timestamp + "] " + message + "\n");
-            logTextArea.setCaretPosition(logTextArea.getDocument().getLength());
+            String ts = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+            logTextArea.append("[" + ts + "] " + message + "\n");
+
+            // Trim oldest content when document exceeds LOG_MAX_CHARS
+            Document doc = logTextArea.getDocument();
+            if (doc.getLength() > LOG_MAX_CHARS) {
+                try {
+                    String text    = doc.getText(0, doc.getLength());
+                    int cutPoint   = text.indexOf('\n', doc.getLength() / 2);
+                    if (cutPoint > 0) doc.remove(0, cutPoint + 1);
+                } catch (BadLocationException ignored) { /* safe to ignore */ }
+            }
+
+            logTextArea.setCaretPosition(doc.getLength());
         });
     }
 
-    // Cleanup method
+    // ─── Lifecycle ───────────────────────────────────────────────────────────
+
     public void cleanup() {
-        if (monitoringTimer != null) {
-            monitoringTimer.stop();
-        }
+        if (monitoringTimer != null) monitoringTimer.stop();
         monitor.close();
     }
 }

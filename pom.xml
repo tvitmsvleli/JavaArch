@@ -10,9 +10,9 @@
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
+    <!-- Bug 5 fixed: removed conflicting maven.compiler.source/target=1.8 properties.
+         Single source of truth for Java version is the maven-compiler-plugin below. -->
     <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -25,9 +25,8 @@
                 <configuration>
                     <source>14</source>
                     <target>14</target>
-                    <compilerArgs>
-                        <arg>-Xlint:-options</arg>
-                    </compilerArgs>
+                    <!-- No --add-exports here: that flag is a JVM runtime arg, not a javac arg.
+                         com.sun.management is visible to javac via the JDK's own module path. -->
                 </configuration>
             </plugin>
 
